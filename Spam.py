@@ -1,106 +1,116 @@
-import re
+import math
+from typing import Dict, Tuple
+
 import streamlit as st
-from transformers import pipeline
-
-# Recommended for emails (Enron). For SMS model, replace with:
-# MODEL_NAME = "mrm8488/bert-tiny-finetuned-sms-spam-detection"
-MODEL_NAME = "mrm8488/bert-tiny-finetuned-enron-spam-detection"
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 
-def clean_text(text: str) -> str:
-    """Light cleanup for pasted emails (remove html tags + normalize whitespace)."""
-    text = re.sub(r"<[^>]+>", " ", text)        # remove HTML tags
-    text = re.sub(r"\s+", " ", text).strip()    # collapse whitespace
-    return text
+st.set_page_config(page_title="Spam Detector", page_icon="📧", layout="centered")
+st.title("📧 Spam Detector (Transformers)")
+st.caption("Paste a message → get a spam probability and a clear decision using a threshold you control.")
+
+MODEL_ID = "mrm8488/bert-tiny-finetuned-sms-spam-detection"
 
 
 @st.cache_resource
-def load_classifier(model_name: str):
-    # return_all_scores gives us both classes; truncation helps on long emails
-    return pipeline(
-        task="text-classification",
-        model=model_name,
-        tokenizer=model_name,
-        return_all_scores=True,
+def load_model():
+    torch.set_num_threads(2)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_ID)
+    model.eval()
+    return tokenizer, model
+
+
+def _softmax(logits: torch.Tensor) -> torch.Tensor:
+    # logits: [1, num_labels]
+    return torch.softmax(logits, dim=-1)
+
+
+def get_label_mapping(model) -> Dict[int, str]:
+    # Robustly pull id2label; fall back to LABEL_0/LABEL_1
+    id2label = getattr(model.config, "id2label", None) or {}
+    if not id2label:
+        return {0: "ham", 1: "spam"}
+    # Keys sometimes strings in HF configs
+    out = {}
+    for k, v in id2label.items():
+        out[int(k)] = str(v)
+    return out
+
+
+def infer_spam(text: str) -> Tuple[float, Dict[str, float]]:
+    tokenizer, model = load_model()
+    enc = tokenizer(
+        text,
         truncation=True,
+        padding=True,
+        max_length=256,
+        return_tensors="pt",
     )
+    with torch.no_grad():
+        logits = model(**enc).logits  # [1, num_labels]
+        probs = _softmax(logits).squeeze(0)  # [num_labels]
+
+    mapping = get_label_mapping(model)  # {0: label0, 1: label1}
+    # Normalize labels (LABEL_0 → ham, LABEL_1 → spam if ambiguous)
+    labels = {i: mapping.get(i, f"LABEL_{i}") for i in range(probs.numel())}
+
+    # Heuristic: if any label contains "spam", that's spam; else assume index 1 is spam
+    spam_idx = None
+    for i, lab in labels.items():
+        if "spam" in lab.lower():
+            spam_idx = i
+            break
+    if spam_idx is None:
+        spam_idx = 1 if probs.numel() > 1 else 0
+
+    spam_prob = float(probs[spam_idx].item())
+
+    per_label = {labels[i]: float(probs[i].item()) for i in range(probs.numel())}
+    return spam_prob, per_label
 
 
-def to_score_map(model_output):
-    """
-    model_output format (return_all_scores=True):
-      [[{'label': 'LABEL_0', 'score': ...}, {'label': 'LABEL_1', 'score': ...}]]
-    """
-    scores = model_output[0]
-    score_map = {d["label"]: float(d["score"]) for d in scores}
-    return score_map
+with st.expander("Model info", expanded=False):
+    st.write(f"Model: `{MODEL_ID}`")
+    st.write("Runs on CPU. First run may take longer due to model download.")
 
+default_example = "Congratulations! You have won a $1,000 gift card. Click the link to claim now."
+text = st.text_area("Message text", value=default_example, height=160)
 
-st.set_page_config(page_title="Spam Detector", page_icon="🛡️", layout="centered")
-st.title("🛡️ Spam Detector (Email/SMS)")
-st.caption(f"Model: `{MODEL_NAME}`")
+threshold = st.slider("Spam threshold", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
 
-with st.sidebar:
-    st.header("Settings")
-    threshold = st.slider("Spam threshold", 0.00, 1.00, 0.50, 0.01)
+colA, colB = st.columns([1, 1])
+with colA:
+    run = st.button("Run detection", type="primary")
+with colB:
+    st.caption("Tip: if it flags too much as spam, raise the threshold (e.g., 0.7).")
 
-    # Because some models output LABEL_0/LABEL_1 without meaning,
-    # let the user explicitly decide which label is SPAM.
-    spam_label = st.selectbox("Which label means SPAM?", ["LABEL_1", "LABEL_0"], index=0)
-
-    st.markdown("---")
-    st.write("Tip: Raise threshold to reduce false positives (good emails marked spam).")
-
-email_text = st.text_area(
-    "Paste your email (or message) text:",
-    height=240,
-    placeholder="Paste the email body here…",
-)
-
-col1, col2 = st.columns([1, 1])
-with col1:
-    detect = st.button("Detect", type="primary")
-with col2:
-    st.button("Clear", on_click=lambda: st.session_state.update({"_clear": True}))
-
-if detect:
-    if not email_text.strip():
-        st.warning("Please paste some text first.")
+if run:
+    if not text.strip():
+        st.warning("Please paste a message.")
         st.stop()
 
-    clf = load_classifier(MODEL_NAME)
-    x = clean_text(email_text)
-
-    output = clf(x)
-    score_map = to_score_map(output)
-
-    # Determine spam probability from chosen spam_label
-    spam_prob = score_map.get(spam_label, 0.0)
+    with st.spinner("Running model..."):
+        spam_prob, per_label = infer_spam(text.strip())
 
     is_spam = spam_prob >= threshold
+    decision = "SPAM 🚫" if is_spam else "NOT SPAM ✅"
 
-    # Friendly result header
-    if is_spam:
-        st.error("Result: **SPAM**", icon="🚫")
-    else:
-        st.success("Result: **NOT SPAM**", icon="✅")
+    st.subheader("Decision")
+    st.metric("Result", decision, delta=f"spam prob: {spam_prob:.3f}")
 
-    st.write(f"**Spam probability:** `{spam_prob:.3f}` (threshold = `{threshold:.2f}`)")
+    st.subheader("Probabilities")
     st.progress(min(max(spam_prob, 0.0), 1.0))
+    st.write(f"Spam probability: **{spam_prob:.3f}** (threshold: `{threshold:.2f}`)")
 
-    # Show both label scores in a readable way
-    st.subheader("Details")
-    # Sort by score descending for readability
-    sorted_items = sorted(score_map.items(), key=lambda kv: kv[1], reverse=True)
-    for label, score in sorted_items:
-        tag = " ← used as SPAM" if label == spam_label else ""
-        st.write(f"- `{label}`: `{score:.3f}`{tag}")
+    st.dataframe(
+        [{"label": k, "prob": v} for k, v in sorted(per_label.items(), key=lambda x: -x[1])],
+        use_container_width=True,
+    )
 
-    with st.expander("Raw model output"):
-        st.json(output)
-
-st.markdown("---")
-st.caption("Note: Long emails may be truncated by the model; results are best-effort.")
-
-st.divider()
-st.caption("Developed by Dr. Jishan Ahmed")
+    st.subheader("How to interpret")
+    st.write(
+        "The model outputs probabilities for each label. "
+        "You choose a threshold: if `spam_prob ≥ threshold`, we call it spam."
+    )
